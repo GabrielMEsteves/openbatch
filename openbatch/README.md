@@ -1,12 +1,49 @@
-# React + Vite
+# OpenBatch
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+## Frontend em contêiner
 
-Currently, two official plugins are available:
+O frontend utiliza um build multi-stage: o Node.js compila a aplicação React e
+somente os arquivos estáticos gerados são copiados para a imagem final do Nginx.
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+Construa a imagem a partir desta pasta:
 
-## Expanding the ESLint configuration
+```bash
+docker build -f Dockerfile.frontend -t openbatch-frontend .
+```
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+Quando o backend estiver em outro contêiner na mesma rede Docker com o nome
+`backend` e porta `8080`:
+
+```bash
+docker run --rm --name openbatch-frontend \
+  --network openbatch \
+  -p 80:80 \
+  openbatch-frontend
+```
+
+Para executar o frontend contra um backend iniciado diretamente na máquina host:
+
+```bash
+docker run --rm --name openbatch-frontend \
+  --add-host=host.docker.internal:host-gateway \
+  -e BACKEND_HOST=host.docker.internal \
+  -e BACKEND_PORT=8080 \
+  -p 80:80 \
+  openbatch-frontend
+```
+
+O Nginx entrega a SPA e encaminha `/login`, `/api/*` e `/ws` para o backend.
+As variáveis `BACKEND_HOST` e `BACKEND_PORT` são aplicadas quando o contêiner
+inicia, portanto a mesma imagem pode ser usada em ambientes diferentes.
+
+O health check do frontend está disponível em `/health`.
+
+## Desenvolvimento local
+
+```bash
+npm install
+npm run dev
+```
+
+O servidor de desenvolvimento do Vite encaminha as rotas do backend conforme a
+configuração de `vite.config.js`.
