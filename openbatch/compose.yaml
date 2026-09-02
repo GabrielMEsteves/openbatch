@@ -1,0 +1,53 @@
+services:
+  backend:
+    image: openbatch-backend:local
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    environment:
+      NODE_ENV: production
+      PORT: 8080
+      JWT_SECRET: ${JWT_SECRET:?Defina JWT_SECRET no arquivo .env}
+      JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-1h}
+      ENABLE_DEV_LOGIN: ${ENABLE_DEV_LOGIN:-false}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      CORS_ORIGIN: ${CORS_ORIGIN:-}
+      UPLOAD_MAX_SIZE_MB: ${UPLOAD_MAX_SIZE_MB:-50}
+    expose:
+      - "8080"
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:8080/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - openbatch
+
+  frontend:
+    image: openbatch-frontend:local
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    environment:
+      BACKEND_HOST: backend
+      BACKEND_PORT: 8080
+    ports:
+      - "${FRONTEND_PORT:-80}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - openbatch
+
+networks:
+  openbatch:
+    driver: bridge

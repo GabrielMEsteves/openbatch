@@ -20,23 +20,61 @@ const execPromise = util.promisify(exec);
 
 const BLOCKED_USERS = ['root', 'daemon', 'bin', 'sys', 'sync', 'games', 'man', 'lp', 'mail', 'news', 'uucp', 'proxy', 'www-data', 'backup', 'list', 'irc', 'gnats', 'nobody'];
 const BLOCKED_EXTENSIONS = ['.exe', '.dll', '.so', '.bin'];
+const NODE_ENV = process.env.NODE_ENV || 'development';
+const PORT = Number.parseInt(process.env.PORT || '8080', 10);
+const JWT_SECRET = process.env.JWT_SECRET;
+const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '1h';
+const ENABLE_DEV_LOGIN = process.env.ENABLE_DEV_LOGIN === 'true';
+const UPLOAD_MAX_SIZE_MB = Number.parseInt(process.env.UPLOAD_MAX_SIZE_MB || '50', 10);
+const CORS_ORIGINS = (process.env.CORS_ORIGIN || '')
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
+if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) {
+  throw new Error('PORT deve ser um numero inteiro entre 1 e 65535.');
+}
+
+if (!JWT_SECRET || (NODE_ENV === 'production' && JWT_SECRET.length < 32)) {
+  throw new Error('JWT_SECRET e obrigatoria e deve possuir ao menos 32 caracteres em producao.');
+}
+
+if (!Number.isInteger(UPLOAD_MAX_SIZE_MB) || UPLOAD_MAX_SIZE_MB < 1) {
+  throw new Error('UPLOAD_MAX_SIZE_MB deve ser um numero inteiro positivo.');
+}
+
+if (ENABLE_DEV_LOGIN && !process.env.ADMIN_PASSWORD) {
+  throw new Error('ADMIN_PASSWORD e obrigatoria quando ENABLE_DEV_LOGIN=true.');
+}
 
 const app = express();
-const upload = multer({ dest: '/tmp/' });
+const upload = multer({
+  dest: '/tmp/',
+  limits: { fileSize: UPLOAD_MAX_SIZE_MB * 1024 * 1024, files: 1 },
+});
 
-app.use(cors());
+app.disable('x-powered-by');
+if (CORS_ORIGINS.length > 0) {
+  app.use(cors({ origin: CORS_ORIGINS }));
+} else if (NODE_ENV !== 'production') {
+  app.use(cors());
+}
 app.use(express.static(path.join(__dirname, 'dist')));
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
 
 const server = http.createServer(app);
+
+app.get('/api/health', (req, res) => {
+  res.status(200).json({ status: 'ok', service: 'openbatch-backend' });
+});
 
 // --- 1. LOGIN ---
 app.post('/login', (req, res) => {
     const { username, password } = req.body;
     if (!username || !password) return res.status(400).json({ message: 'Campos obrigatórios.' });
 
-    if (username === 'admin' && password === process.env.ADMIN_PASSWORD) {
-        const token = jwt.sign({ username: 'admin' }, process.env.JWT_SECRET, { expiresIn: '1h' });
+    if (ENABLE_DEV_LOGIN && username === 'admin' && password === process.env.ADMIN_PASSWORD) {
+        const token = jwt.sign({ username: 'admin' }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
         return res.status(200).json({ message: 'Login DEV.', token });
     }
 
@@ -48,7 +86,7 @@ app.post('/login', (req, res) => {
             console.error(`Erro PAM ${username}:`, err);
             return res.status(401).json({ message: 'Credenciais inválidas.' });
         }
-        const token = jwt.sign({ username }, process.env.JWT_SECRET, { expiresIn: '1h' });
+        const token = jwt.sign({ username }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
         res.status(200).json({ message: 'Sucesso.', token });
         });
     } catch (e) {
@@ -63,7 +101,7 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
 
   if (!token) return res.status(401).json({ message: 'Token não fornecido' });
 
-  jwt.verify(token, process.env.JWT_SECRET, async (err, decoded) => {
+  jwt.verify(token, JWT_SECRET, async (err, decoded) => {
     if (err) return res.status(403).json({ message: 'Token inválido' });
 
     const username = decoded.username;
@@ -239,7 +277,7 @@ const type = url.searchParams.get('type') || 'shell';
 
 if (!token) return ws.close(1008, 'Token ausente');
 
-jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
+jwt.verify(token, JWT_SECRET, (err, decoded) => {
     if (err) return ws.close(1008, 'Token inválido');
     const username = decoded.username;
 
@@ -327,4 +365,4 @@ jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
 });
 });
 
-server.listen(process.env.PORT, () => console.log(`Backend rodando na porta ${process.env.PORT}`));
+server.listen(PORT, '0.0.0.0', () => console.log(`Backend rodando na porta ${PORT}`));
