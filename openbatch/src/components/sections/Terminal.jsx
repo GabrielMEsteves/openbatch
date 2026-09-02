@@ -18,8 +18,10 @@ function TerminalComponent() {
       return;
     }
 
-    // Configuração do WebSocket
-    const wsUrl = `ws://${window.location.hostname}:8080/?token=${token}`;
+    // Usa a mesma origem do frontend. Em produção, o Nginx encaminha
+    // /ws ao backend; em desenvolvimento, o Vite faz esse proxy.
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${protocol}//${window.location.host}/ws?token=${encodeURIComponent(token)}`;
     const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
 

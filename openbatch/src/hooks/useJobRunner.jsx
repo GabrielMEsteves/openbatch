@@ -34,7 +34,7 @@ export function useJobRunner() {
 
     try {
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const wsUrl = `${protocol}//${window.location.hostname}:8080/?token=${token}&type=job`;
+        const wsUrl = `${protocol}//${window.location.host}/ws?token=${encodeURIComponent(token)}&type=job`;
       
         const ws = new WebSocket(wsUrl);
         wsRef.current = ws;
@@ -42,6 +42,7 @@ export function useJobRunner() {
         ws.onopen = () => {
             setStatus(JOB_STATUS.RUNNING);
             addLog("Conexão estabelecida. Enviando payload do job...", 'success');
+            ws.send(JSON.stringify(jobConfig));
         };
 
         ws.onmessage = (event) => {
