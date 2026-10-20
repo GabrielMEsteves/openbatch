@@ -1,0 +1,17 @@
+import jwt from 'jsonwebtoken';
+import assert from 'node:assert/strict';
+const headersFor = username => ({ Authorization: `Bearer ${jwt.sign({ username }, process.env.JWT_SECRET, { expiresIn: '1m' })}` });
+const response = await fetch('http://frontend/api/container-jobs', { headers: headersFor('julia') });
+assert.equal(response.status, 200);
+const records = await response.json();
+assert.ok(records.length > 0);
+const latest = await fetch(`http://frontend/api/container-jobs/${records[0].id}`, { headers: headersFor('julia') });
+const status = await latest.json();
+assert.equal(latest.status, 200);
+assert.ok(status.terminal);
+assert.equal(status.cleanup, 'done');
+const denied = await fetch(`http://frontend/api/container-jobs/${records[0].id}`, { headers: headersFor('other-user') });
+assert.equal(denied.status, 400);
+const admin = await fetch('http://frontend/api/container-jobs', { headers: headersFor('admin') });
+assert.equal(admin.status, 403);
+console.log('Proxy, estado persistido após reinício, reconciliação e isolamento entre usuários: OK');

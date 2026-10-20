@@ -1,0 +1,22 @@
+{
+  "name": "openbatch-backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "2.8.5",
+    "dotenv": "17.2.3",
+    "express": "5.1.0",
+    "jsonwebtoken": "9.0.2",
+    "multer": "2.0.2",
+    "node-linux-pam": "0.2.1",
+    "node-pty": "1.0.0",
+    "ws": "8.18.3"
+  }
+}

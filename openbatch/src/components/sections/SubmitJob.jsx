@@ -1,5 +1,6 @@
 import React, { useRef, useEffect, useState } from 'react';
 import { useJobRunner, JOB_STATUS } from '../../hooks/useJobRunner';
+import ContainerJobs from './ContainerJobs';
 
 import Editor from 'react-simple-code-editor';
 import { highlight, languages } from 'prismjs/components/prism-core';
@@ -42,9 +43,26 @@ function SubmitJob() {
   const { logs, status, runJob, isRunning } = useJobRunner();
   const logsEndRef = useRef(null);
   
-  const [submissionMode, setSubmissionMode] = useState('command');
+  const [submissionMode, setSubmissionMode] = useState('container');
   const [commandInput, setCommandInput] = useState('sbatch meu_script.sh');
   const [scriptCode, setScriptCode] = useState(DEFAULT_SCRIPT);
+  const [podmanConsole, setPodmanConsole] = useState({ selected: null, error: '', busy: false });
+  const podmanJob = podmanConsole.selected;
+  const consoleStatus = submissionMode === 'container'
+    ? (podmanJob?.state || (podmanConsole.busy ? 'submitting' : podmanConsole.error ? 'error' : 'idle'))
+    : status;
+  const consoleLogs = submissionMode === 'container' ? [
+    ...(podmanJob ? [{ type: 'info', message: `Job ${podmanJob.jobId || 'sem ID confirmado'} — ${consoleStatus}` }] : []),
+    ...(podmanJob?.message ? [{ type: 'info', message: podmanJob.message }] : []),
+    ...(podmanJob ? [
+      { type: 'info', message: 'Saída padrão (últimos 64 KiB)' },
+      { type: 'normal', message: podmanJob.stdout || 'Sem saída disponível.' },
+      { type: 'info', message: 'Saída de erro / diagnóstico (últimos 64 KiB)' },
+      { type: 'normal', message: podmanJob.stderr || 'Sem saída de erro disponível.' },
+    ] : []),
+    ...(podmanConsole.error ? [{ type: 'error', message: podmanConsole.error }] : []),
+  ] : logs;
+  const consoleText = consoleLogs.map(log => log.message).join('\n');
 
   // Estados do Formulário (Sincronizados com o Script)
   const [formConfig, setFormConfig] = useState({
@@ -59,7 +77,7 @@ function SubmitJob() {
 
   useEffect(() => {
     logsEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [logs]);
+  }, [consoleText]);
 
   // --- LÓGICA DE SINCRONIZAÇÃO FORMULÁRIO -> SCRIPT ---
   const updateScriptDirective = (key, value) => {
@@ -155,6 +173,7 @@ function SubmitJob() {
       
       <div className="content-box">
         <div className="submission-tabs">
+          <button className={`sub-tab ${submissionMode === 'container' ? 'active' : ''}`} type="button" onClick={() => setSubmissionMode('container')}>Job com Podman</button>
           <button 
             className={`sub-tab ${submissionMode === 'command' ? 'active' : ''}`}
             onClick={() => setSubmissionMode('command')}
@@ -171,7 +190,7 @@ function SubmitJob() {
           </button>
         </div>
 
-        <form onSubmit={handleSubmit} style={{ marginTop: '20px' }}>
+        {submissionMode === 'container' ? <ContainerJobs onConsoleChange={setPodmanConsole} /> : <form onSubmit={handleSubmit} style={{ marginTop: '20px' }}>
           {submissionMode === 'command' ? (
             <div className="form-group fade-in">
               <label htmlFor="slurm-command">Comando do Terminal</label>
@@ -246,20 +265,20 @@ function SubmitJob() {
               </button>
             </div>
           </div>
-        </form>
+        </form>}
       </div>
       
       <div className="job-output-container">
         <div className="job-output-header">
           <span className="job-output-title">Console de Saída</span>
-          <span style={{ fontSize: '0.8em', color: getStatusColor(status) }}>Status: {status}</span>
+          <span style={{ fontSize: '0.8em', color: getStatusColor(consoleStatus) }}>Status: {consoleStatus}</span>
         </div>
         <div className="job-log-area">
-          {logs.length === 0 ? (
+          {consoleLogs.length === 0 ? (
             <div className="log-placeholder">Os logs aparecerão aqui...</div>
           ) : (
-            logs.map((log, index) => (
-              <div key={index} className={`log-line ${log.type}`}>{log.message}</div>
+            consoleLogs.map((log, index) => (
+              <div key={index} className={`log-line ${log.type}`} style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{log.message}</div>
             ))
           )}
           <div ref={logsEndRef} />
@@ -273,6 +292,11 @@ function getStatusColor(status) {
   switch(status) {
     case JOB_STATUS.RUNNING: return '#38BDF8'; 
     case JOB_STATUS.COMPLETED: return '#51cf66'; 
+    case 'COMPLETED': return '#51cf66';
+    case 'RUNNING': return '#38BDF8';
+    case 'FAILED':
+    case 'OUT_OF_MEMORY':
+    case 'TIMEOUT':
     case JOB_STATUS.ERROR: return '#ff6b6b'; 
     default: return '#94A3B8'; 
   }
