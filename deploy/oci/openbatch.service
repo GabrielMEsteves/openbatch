@@ -1,0 +1,24 @@
+[Unit]
+Description=OpenBatch API and web terminal
+After=network-online.target munge.service slurmctld.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# PAM, runuser and terminal sessions currently require root.
+User=root
+Group=root
+WorkingDirectory=/opt/openbatch/current
+EnvironmentFile=/etc/openbatch/openbatch.env
+ExecStart=/usr/bin/node /opt/openbatch/current/server.js
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+StateDirectory=openbatch
+StateDirectoryMode=0700
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,138 @@
+name: OpenBatch CI/CD OCI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Never cancel a deployment while it is switching releases.
+concurrency:
+  group: openbatch-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  ci:
+    name: Lint, tests and build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+        working-directory: openbatch
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: |
+            openbatch/package-lock.json
+            openbatch/backend/package-lock.json
+      - name: Install frontend and lint dependencies
+        # Native backend modules are built separately, using its own lockfile.
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm run lint
+      - name: Check deployment scripts
+        working-directory: .
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends shellcheck
+          bash -n deploy/oci/bootstrap.sh deploy/oci/deploy.sh
+          shellcheck deploy/oci/bootstrap.sh deploy/oci/deploy.sh
+      - name: Install native backend dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential python3 libpam0g-dev
+          npm ci --prefix backend --omit=dev --no-audit --no-fund
+          (cd backend && node --input-type=module -e "import 'node-pty'; import 'node-linux-pam'")
+      - name: Test job validation and script generation
+        run: node --test podman-jobs.test.js
+      - run: npm run build
+      - name: Package the tested release
+        run: |
+          mkdir -p "$RUNNER_TEMP/release"
+          cp backend/package.json backend/package-lock.json "$RUNNER_TEMP/release/"
+          cp server.js podman-jobs.js ssh-askpass.sh "$RUNNER_TEMP/release/"
+          chmod 755 "$RUNNER_TEMP/release/ssh-askpass.sh"
+          cp -R dist "$RUNNER_TEMP/release/"
+          printf '%s\n' "$GITHUB_SHA" > "$RUNNER_TEMP/release/REVISION"
+      - name: Smoke test the packaged backend and frontend
+        working-directory: ${{ runner.temp }}/release
+        run: |
+          set -euo pipefail
+          ln -s "$GITHUB_WORKSPACE/openbatch/backend/node_modules" node_modules
+          NODE_ENV=production HOST=127.0.0.1 PORT=18080 JWT_SECRET="$(openssl rand -hex 32)" \
+            node server.js > "$RUNNER_TEMP/openbatch-smoke.log" 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true; rm -f node_modules' EXIT
+          ready=false
+          for ((attempt=1; attempt<=30; attempt++)); do
+            if curl --fail --silent --max-time 2 http://127.0.0.1:18080/api/health >/dev/null; then
+              ready=true
+              break
+            fi
+            if ! kill -0 "$server_pid" 2>/dev/null; then
+              cat "$RUNNER_TEMP/openbatch-smoke.log"
+              exit 1
+            fi
+            sleep 1
+          done
+          test "$ready" = true
+          curl --fail --silent http://127.0.0.1:18080/ | grep -q '<div id="root">'
+          test "$(curl --silent -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/api/container-jobs)" = 401
+      - name: Archive release without credentials or native dependencies
+        run: |
+          tar -czf "$RUNNER_TEMP/openbatch-release.tar.gz" -C "$RUNNER_TEMP/release" .
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: openbatch-${{ github.sha }}
+          path: ${{ runner.temp }}/openbatch-release.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  deploy:
+    name: Deploy production
+    needs: ci
+    # PR code never runs on the production runner. Manual runs must select main.
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: [self-hosted, Linux, openbatch-production]
+    environment:
+      name: production
+    concurrency:
+      group: openbatch-production
+      cancel-in-progress: false
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # No checkout or git pull on the production machine.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: openbatch-${{ github.sha }}
+          path: ${{ runner.temp }}/openbatch-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Prepare and activate release
+        env:
+          RELEASE_ID: ${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          ARTIFACT_DIR: ${{ runner.temp }}/openbatch-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          test "$(id -un)" = openbatch-runner
+          test "$(/usr/bin/node -p 'process.versions.node.split(".")[0]')" = 22
+          stage="/var/lib/openbatch-delivery/$RELEASE_ID"
+          mkdir -m 700 "$stage"
+          trap 'rm -rf -- "$stage" "$ARTIFACT_DIR"' EXIT
+          tar -xzf "$ARTIFACT_DIR/openbatch-release.tar.gz" -C "$stage" --no-same-owner
+          test "$(cat "$stage/REVISION")" = "$GITHUB_SHA"
+          cd "$stage"
+          # Build addons on the target OS/CPU; never copy CI node_modules to OCI ARM.
+          PATH=/usr/bin:/bin npm ci --omit=dev --no-audit --no-fund
+          /usr/bin/node --input-type=module -e "import 'node-pty'; import 'node-linux-pam'"
+          sudo -n /usr/local/sbin/openbatch-deploy deploy "$RELEASE_ID"

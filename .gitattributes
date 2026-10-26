@@ -1,0 +1,6 @@
+# Linux deployment files must keep LF even when edited on Windows.
+*.sh text eol=lf
+*.yml text eol=lf
+deploy/oci/*.service text eol=lf
+deploy/oci/*.conf text eol=lf
+deploy/oci/*.example text eol=lf

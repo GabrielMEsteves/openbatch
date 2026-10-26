@@ -23,6 +23,7 @@ const BLOCKED_USERS = ['root', 'daemon', 'bin', 'sys', 'sync', 'games', 'man', '
 const BLOCKED_EXTENSIONS = ['.exe', '.dll', '.so', '.bin'];
 const NODE_ENV = process.env.NODE_ENV || 'development';
 const PORT = Number.parseInt(process.env.PORT || '8080', 10);
+const HOST = process.env.HOST || '0.0.0.0';
 const JWT_SECRET = process.env.JWT_SECRET;
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '1h';
 const ENABLE_DEV_LOGIN = process.env.ENABLE_DEV_LOGIN === 'true';
@@ -381,4 +382,4 @@ jwt.verify(token, JWT_SECRET, (err, decoded) => {
 });
 });
 
-server.listen(PORT, '0.0.0.0', () => console.log(`Backend rodando na porta ${PORT}`));
+server.listen(PORT, HOST, () => console.log(`Backend rodando em ${HOST}:${PORT}`));

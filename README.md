@@ -1,5 +1,11 @@
 # OpenBatch
 
+## CI/CD para uma VM na OCI
+
+O [guia completo de CI/CD na OCI](docs/ci-cd-oci.md) explica a preparação de uma VM Ubuntu 24.04, rede, runner GitHub Actions, configuração de produção, HTTPS, build, deploy e rollback. O workflow está em [`.github/workflows/ci-cd-oci.yml`](.github/workflows/ci-cd-oci.yml), com os scripts e configurações em [`deploy/oci/`](deploy/oci/).
+
+Esse fluxo instala a aplicação nativamente com Node.js 22, systemd e Nginx, preservando a integração local com PAM, terminais e SLURM. Ele substitui a etapa de deploy da aplicação pelo Ansible; a configuração do cluster continua sendo um pré-requisito separado.
+
 Uma interface web segura e acessível para gerenciamento de jobs em clusters de Computação de Alto Desempenho (HPC) que utilizam **SLURM** em ambientes de nuvem privada.
 
 O OpenBatch visa abstrair a complexidade da linha de comando, buscando oferecer um portal visual para pesquisadores e administradores submeterem cargas de trabalho, monitorarem recursos e gerenciarem arquivos.
