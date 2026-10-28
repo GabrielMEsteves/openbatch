@@ -2,9 +2,11 @@
 
 ## CI/CD para uma VM na OCI
 
-O [guia completo de CI/CD na OCI](docs/ci-cd-oci.md) explica a preparação de uma VM Ubuntu 24.04, rede, runner GitHub Actions, configuração de produção, HTTPS, build, deploy e rollback. O workflow está em [`.github/workflows/ci-cd-oci.yml`](.github/workflows/ci-cd-oci.yml), com os scripts e configurações em [`deploy/oci/`](deploy/oci/).
+O workflow [`.github/workflows/ci-cd-oci.yml`](.github/workflows/ci-cd-oci.yml) valida a aplicação, constrói e testa imagens ARM64 no GitHub Actions, publica no GHCR e entrega os digests ao runner da VM. A produção usa [`deploy/oci/compose.yaml`](deploy/oci/compose.yaml) com Podman Compose rootless no Ubuntu 24.04 (OCI Ampere).
 
-Esse fluxo instala a aplicação nativamente com Node.js 22, systemd e Nginx, preservando a integração local com PAM, terminais e SLURM. Ele substitui a etapa de deploy da aplicação pelo Ansible; a configuração do cluster continua sendo um pré-requisito separado.
+Frontend/Nginx e backend/Node.js executam em contêineres separados. O bootstrap instala Podman e o provedor Compose; o systemd do usuário inicia os contêineres após reiniciar a VM. O environment `production` fornece o secret obrigatório `JWT_SECRET`; as opções estão em [`deploy/oci/openbatch.env.example`](deploy/oci/openbatch.env.example). O primeiro deploy pode iniciar a interface e a API sem cluster configurado. Para login e jobs via SSH, configure `SLURM_SSH_HOST`, chaves por usuário e `known_hosts` verificado na VM. Nenhum usuário de demonstração é habilitado pelo deploy. O deploy valida a configuração, verifica a saúde da aplicação e tenta restaurar a release anterior se a ativação falhar.
+
+O fluxo substitui somente o deploy da aplicação pelo Ansible; o cluster continua sendo um pré-requisito separado. Login e jobs Podman usam a integração SSH existente. Terminal, uploads e comandos do fluxo legado ainda dependem do ambiente local e não são disponibilizados no cluster por esta conteinerização; consulte [`openbatch/README.md`](openbatch/README.md).
 
 Uma interface web segura e acessível para gerenciamento de jobs em clusters de Computação de Alto Desempenho (HPC) que utilizam **SLURM** em ambientes de nuvem privada.
 

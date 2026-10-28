@@ -1,0 +1,57 @@
+services:
+  backend:
+    image: ${BACKEND_IMAGE:?Defina a imagem do backend por digest}
+    env_file:
+      - ./backend.env
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 8080
+      ENABLE_DEV_LOGIN: "false"
+      SLURM_SSH_KEY_DIR: /run/slurm-ssh
+      SLURM_SSH_KNOWN_HOSTS: /run/slurm-ssh/known_hosts
+      OPENBATCH_JOB_STORE: /var/lib/openbatch/podman-jobs
+    volumes:
+      - ${SLURM_SSH_MOUNT:?Defina a pasta SSH}:/run/slurm-ssh:ro,Z
+      - podman-job-records:/var/lib/openbatch/podman-jobs
+    tmpfs:
+      - /tmp:size=${UPLOAD_TMP_SIZE_MB:-128}m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:8080/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    restart: unless-stopped
+    networks: [openbatch]
+
+  frontend:
+    image: ${FRONTEND_IMAGE:?Defina a imagem do frontend por digest}
+    environment:
+      BACKEND_HOST: backend
+      BACKEND_PORT: 8080
+      NGINX_CLIENT_MAX_BODY_SIZE: ${NGINX_CLIENT_MAX_BODY_SIZE:-51m}
+    ports:
+      - "${FRONTEND_BIND:-127.0.0.1}:${FRONTEND_PORT:-8081}:80"
+    # Readiness is checked explicitly by healthcheck.sh for provider compatibility.
+    depends_on: [backend]
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: [CMD, wget, --quiet, --tries=1, --spider, http://127.0.0.1/health]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
+    restart: unless-stopped
+    networks: [openbatch]
+
+networks:
+  openbatch:
+    driver: bridge
+
+volumes:
+  # A fixed Compose project name preserves this volume across releases/rollbacks.
+  podman-job-records:

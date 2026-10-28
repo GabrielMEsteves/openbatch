@@ -1,3 +1,7 @@
+# WebSocket authentication currently uses a query parameter. Never log query strings.
+log_format openbatch '$remote_addr - $remote_user [$time_local] '
+                     '"$request_method $uri $server_protocol" $status $body_bytes_sent';
+
 server {
     listen 80;
     server_name _;
@@ -6,7 +10,8 @@ server {
     root /usr/share/nginx/html;
     index index.html;
 
-    client_max_body_size 50m;
+    client_max_body_size ${NGINX_CLIENT_MAX_BODY_SIZE};
+    access_log /var/log/nginx/access.log openbatch;
 
     add_header X-Content-Type-Options "nosniff" always;
     add_header X-Frame-Options "DENY" always;
@@ -41,6 +46,8 @@ server {
     }
 
     location /ws {
+        # Nginx error messages can include the complete request URI (including JWT).
+        error_log /dev/null;
         proxy_pass http://${BACKEND_HOST}:${BACKEND_PORT};
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;

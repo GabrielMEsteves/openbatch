@@ -1,54 +1,59 @@
 #!/usr/bin/env bash
-# Run once as an administrator, from a reviewed repository checkout.
+# Administrative setup only. Application code never executes as host root.
 set -euo pipefail
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 umask 022
-
-[[ $EUID -eq 0 ]] || { echo 'Execute com sudo.' >&2; exit 1; }
-domain=${1:-}
-[[ $# -eq 1 && "$domain" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]] || {
-  echo 'Uso: sudo bash deploy/oci/bootstrap.sh openbatch.seudominio.com' >&2; exit 1;
+[[ $EUID -eq 0 && $# -eq 0 ]] || {
+  echo 'Uso: sudo bash deploy/oci/bootstrap.sh (sem argumento de dominio)' >&2; exit 1;
 }
 # shellcheck source=/dev/null
 source /etc/os-release
-[[ "$ID" == ubuntu && "$VERSION_ID" == 24.04 ]] || {
-  echo 'Este bootstrap requer Ubuntu 24.04.' >&2; exit 1;
-}
-[[ -x /usr/bin/node && $(/usr/bin/node -p 'process.versions.node.split(".")[0]') == 22 ]] || {
-  echo 'Instale Node.js 22 em /usr/bin/node antes do bootstrap.' >&2; exit 1;
-}
+case "$ID:$VERSION_ID" in
+  ubuntu:24.04)
+    apt-get update
+    apt-get install -y --no-install-recommends podman uidmap slirp4netns fuse-overlayfs \
+      python3-venv dbus-user-session curl ca-certificates git openssl openssh-client util-linux
+    ;;
+  *) echo 'Bootstrap suportado: Ubuntu 24.04.' >&2; exit 1 ;;
+esac
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-
-apt-get update
-apt-get install -y --no-install-recommends \
-  nginx build-essential python3 libpam0g-dev libpam-modules libpam-runtime \
-  clamav clamav-freshclam unzip openssh-client curl ca-certificates git rsync sudo openssl util-linux
+python3 -m venv /opt/openbatch-tools
+/opt/openbatch-tools/bin/pip install --disable-pip-version-check 'podman-compose==1.5.0'
 
 if ! id openbatch-runner >/dev/null 2>&1; then
   useradd --create-home --shell /bin/bash openbatch-runner
 fi
-install -d -o root -g root -m 0755 /opt/openbatch /opt/openbatch/releases
-install -d -o root -g root -m 0700 /etc/openbatch /var/lib/openbatch
-install -d -o openbatch-runner -g openbatch-runner -m 0700 /var/lib/openbatch-delivery
-if [[ ! -e /etc/openbatch/openbatch.env ]]; then
-  install -o root -g root -m 0600 "$script_dir/openbatch.env.example" /etc/openbatch/openbatch.env
-  secret=$(openssl rand -hex 32)
-  sed -i "s/REPLACE_WITH_OPENSSL_RAND_HEX_32/$secret/" /etc/openbatch/openbatch.env
-fi
+runner_uid=$(id -u openbatch-runner)
+runner_home=$(getent passwd openbatch-runner | cut -d: -f6)
+for mapping in subuid subgid; do
+  touch "/etc/$mapping"
+  if ! grep -q '^openbatch-runner:' "/etc/$mapping"; then
+    first=$(awk -F: 'BEGIN{n=100000} NF==3{end=$2+$3;if(end>n)n=end} END{print n}' "/etc/$mapping")
+    usermod "--add-${mapping}s" "$first-$((first + 65535))" openbatch-runner
+  fi
+done
 
-install -o root -g root -m 0755 "$script_dir/deploy.sh" /usr/local/sbin/openbatch-deploy
-install -o root -g root -m 0644 "$script_dir/openbatch.service" /etc/systemd/system/openbatch.service
-sudoers_tmp=$(mktemp)
-trap 'rm -f -- "$sudoers_tmp"' EXIT
-printf '%s\n' 'openbatch-runner ALL=(root) NOPASSWD: /usr/local/sbin/openbatch-deploy *' > "$sudoers_tmp"
-visudo -cf "$sudoers_tmp"
-install -o root -g root -m 0440 "$sudoers_tmp" /etc/sudoers.d/openbatch-deploy
+# Revoke the sudo entry installed by the previous native-deployment bootstrap.
+rm -f /etc/sudoers.d/openbatch-deploy /usr/local/sbin/openbatch-deploy
+# Keep an existing native service running until the administrator switches the
+# external proxy to the new frontend port and verifies the container deployment.
 
-sed "s/__SERVER_NAME__/$domain/" "$script_dir/nginx.conf" > /etc/nginx/sites-available/openbatch
-ln -sfn /etc/nginx/sites-available/openbatch /etc/nginx/sites-enabled/openbatch
-nginx -t
-systemctl daemon-reload
-systemctl enable openbatch nginx clamav-freshclam
-systemctl restart clamav-freshclam
-systemctl reload-or-restart nginx
-echo 'Base instalada. Configure o runner e execute o workflow; depois habilite HTTPS conforme o guia.'
+install -d -o openbatch-runner -g openbatch-runner -m 0700 \
+  "$runner_home/.local" "$runner_home/.local/share" "$runner_home/.local/share/openbatch" \
+  "$runner_home/.local/share/openbatch/releases" "$runner_home/.local/share/openbatch/ssh"
+install -d -o root -g root -m 0755 /usr/local/lib/openbatch
+install -m 0755 "$script_dir/deploy.sh" /usr/local/bin/openbatch-deploy
+install -m 0755 "$script_dir/compose-service.sh" "$script_dir/healthcheck.sh" /usr/local/lib/openbatch/
+install -m 0644 "$script_dir/prepare-release.py" "$script_dir/compose.yaml" /usr/local/lib/openbatch/
+install -m 0644 "$script_dir/openbatch-compose.service" /etc/systemd/user/openbatch-compose.service
+
+loginctl enable-linger openbatch-runner
+systemctl start "user@$runner_uid.service"
+runuser -u openbatch-runner -- env XDG_RUNTIME_DIR="/run/user/$runner_uid" \
+  DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$runner_uid/bus" systemctl --user daemon-reload
+runuser -u openbatch-runner -- env XDG_RUNTIME_DIR="/run/user/$runner_uid" \
+  DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$runner_uid/bus" systemctl --user enable openbatch-compose.service
+echo "Podman rootless preparado para openbatch-runner (UID $runner_uid)."
+echo "Para integrar o cluster depois, instale known_hosts e <usuario>.key em $runner_home/.local/share/openbatch/ssh/"
+echo 'Configure production no GitHub. O primeiro deploy iniciara os conteineres.'
+echo 'Se houver deploy nativo anterior, migre os dados e o proxy antes de desativar openbatch.service.'

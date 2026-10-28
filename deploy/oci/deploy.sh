@@ -1,112 +1,90 @@
 #!/usr/bin/env bash
-# Root-owned entry point. Never run a script from the runner checkout with sudo.
 set -euo pipefail
-export PATH=/usr/sbin:/usr/bin:/sbin:/bin
-umask 022
-
-[[ $EUID -eq 0 ]] || { echo 'Execute com sudo.' >&2; exit 1; }
-action=${1:-}
-release_id=${2:-}
-[[ $# -eq 2 && "$action" =~ ^(deploy|rollback)$ && "$release_id" =~ ^[a-f0-9]{40}-[0-9]+-[0-9]+$ ]] || {
-  echo 'Uso: openbatch-deploy deploy|rollback SHA40-RUN_ID-ATTEMPT' >&2; exit 1;
+umask 077
+[[ $EUID -ne 0 && $(id -un) == openbatch-runner ]] || {
+  echo 'Execute como openbatch-runner, sem sudo.' >&2; exit 1;
 }
-exec 9>/run/lock/openbatch-deploy.lock
+[[ $# -eq 2 && "$1" =~ ^(deploy|rollback)$ ]] || {
+  echo 'Uso: openbatch-deploy deploy /caminho/release.json | rollback SHA-RUN-TENTATIVA' >&2; exit 1;
+}
+XDG_RUNTIME_DIR="/run/user/$(id -u)"
+export XDG_RUNTIME_DIR
+export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+export PODMAN_COMPOSE_PROVIDER=/opt/openbatch-tools/bin/podman-compose
+base="$HOME/.local/share/openbatch"
+lib=/usr/local/lib/openbatch
+exec 9>"$base/deploy.lock"
 flock -n 9 || { echo 'Outro deploy esta em andamento.' >&2; exit 1; }
-
-base=/opt/openbatch
-target="$base/releases/$release_id"
+[[ $(podman info --format '{{.Host.Security.Rootless}}') == true ]] || {
+  echo 'Podman precisa operar em modo rootless.' >&2; exit 1;
+}
+systemctl --user is-enabled --quiet openbatch-compose.service
 previous=''
 if [[ -L "$base/current" ]]; then
   previous=$(readlink -e "$base/current")
   [[ "$previous" == "$base/releases/"* ]] || { echo 'Release atual fora de releases.' >&2; exit 1; }
 elif [[ -e "$base/current" ]]; then
-  echo '/opt/openbatch/current precisa ser um link simbolico.' >&2; exit 1
+  echo 'current precisa ser um link simbolico.' >&2; exit 1
 fi
-[[ "$previous" != "$target" ]] || { echo 'Release ja esta ativa.' >&2; exit 1; }
 
-[[ -f /etc/openbatch/openbatch.env ]] || { echo 'Arquivo de ambiente ausente.' >&2; exit 1; }
-nginx -t
-if [[ "$action" == deploy ]]; then
-  incoming="/var/lib/openbatch-delivery/$release_id"
-  [[ -d "$incoming" && ! -L "$incoming" && ! -e "$target" && ! -L "$target" ]] || {
-    echo 'Entrega ausente ou release de destino ja existe.' >&2; exit 1;
-  }
-  [[ $(cat "$incoming/REVISION") == "${release_id:0:40}" ]] || {
-    echo 'Revisao da entrega nao corresponde ao identificador.' >&2; exit 1;
-  }
-  for file in server.js podman-jobs.js ssh-askpass.sh package.json package-lock.json dist/index.html node_modules/express/package.json; do
-    [[ -f "$incoming/$file" ]] || { echo "Arquivo ausente: $file" >&2; exit 1; }
-  done
-  # Do not expose partially copied releases through current.
-  install -d -m 0755 "$target"
-  rsync -a --safe-links --chown=root:root --chmod=Du=rwx,Dgo=rx,Fu+rw,Fgo+r,Fgo-w "$incoming/" "$target/"
-  chmod 0755 "$target/ssh-askpass.sh"
+if [[ "$1" == deploy ]]; then
+  release_id=$(python3 "$lib/prepare-release.py" "$2" "$base" "$lib/compose.yaml")
 else
-  [[ -d "$target" && ! -L "$target" && -f "$target/dist/index.html" ]] || {
-    echo 'Release de rollback nao encontrada.' >&2; exit 1;
-  }
+  release_id=$2
 fi
+[[ "$release_id" =~ ^[a-f0-9]{40}-[0-9]+-[0-9]+$ ]] || { echo 'Release invalida.' >&2; exit 1; }
+target="$base/releases/$release_id"
+[[ -d "$target" && ! -L "$target" && -f "$target/release.json" ]] || { echo 'Release inexistente.' >&2; exit 1; }
+[[ "$target" != "$previous" ]] || { echo 'Release ja esta ativa.' >&2; exit 1; }
+
+value() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$1/release.json" "$2"; }
+backend_image=$(value "$target" backend_image)
+frontend_image=$(value "$target" frontend_image)
+architecture=$(value "$target" architecture)
+# Pull both images before stopping any running container. A failed pull keeps
+# production running. Rollback uses retained local images, without registry access.
+for image in "$backend_image" "$frontend_image"; do
+  if [[ "$1" == deploy ]]; then podman pull "$image"; fi
+  [[ $(podman image inspect --format '{{.Architecture}}' "$image") == "$architecture" ]] || {
+    echo 'Arquitetura da imagem incorreta.' >&2; exit 1;
+  }
+done
+podman compose --env-file "$target/compose.env" -f "$target/compose.yaml" -p openbatch config >/dev/null
 
 activate() {
   ln -sfn "$1" "$base/.current-next"
   mv -Tf "$base/.current-next" "$base/current"
 }
-healthy() {
-  local attempt
-  for ((attempt=1; attempt<=30; attempt++)); do
-    if systemctl is-active --quiet openbatch && \
-       curl --fail --silent --max-time 2 http://127.0.0.1:8080/api/health >/dev/null && \
-       curl --fail --silent --max-time 2 http://127.0.0.1:8080/ >/dev/null; then
-      return 0
-    fi
-    sleep 2
-  done
-  return 1
-}
-
+healthy() { bash "$lib/healthcheck.sh" "$(value "$1" frontend_port)"; }
 switched=false
 completed=false
 on_exit() {
   local status=$?
   trap - EXIT INT TERM HUP
   if [[ "$switched" == true && "$completed" != true ]]; then
-    echo 'Falha na ativacao; revertendo a versao.' >&2
-    journalctl -u openbatch -n 40 --no-pager >&2 || true
+    echo 'Falha na ativacao; revertendo os conteineres.' >&2
+    journalctl --user -u openbatch-compose -n 40 --no-pager >&2 || true
     if [[ -n "$previous" ]]; then
-      if activate "$previous" && systemctl restart openbatch && healthy; then
-        echo "Versao anterior restaurada: $(basename "$previous")" >&2
+      if activate "$previous" && systemctl --user restart openbatch-compose && healthy "$previous"; then
+        echo "Release anterior restaurada: $(basename "$previous")" >&2
       else
-        echo 'Rollback falhou. Intervencao do administrador necessaria.' >&2
+        echo 'Rollback falhou; verifique podman ps e o journal do usuario.' >&2
       fi
     else
-      systemctl stop openbatch || true
+      systemctl --user stop openbatch-compose || true
+      podman compose --env-file "$target/compose.env" -f "$target/compose.yaml" -p openbatch stop || true
       rm -f -- "$base/current"
-      echo 'Primeiro deploy falhou; nao existe versao anterior.' >&2
+      echo 'Primeiro deploy falhou; nao existe release anterior.' >&2
     fi
   fi
   exit "$status"
 }
 trap on_exit EXIT
 trap 'exit 130' INT TERM HUP
-
-# Set the flag first so a signal between the switch and restart also rolls back.
 switched=true
 activate "$target"
-systemctl restart openbatch
-healthy || { echo 'Health check da nova versao falhou.' >&2; exit 1; }
-# Verify Nginx -> backend, using the configured virtual host, after local health.
-site_host=$(awk '/^[[:space:]]*server_name / {gsub(/;/, "", $2); print $2; exit}' /etc/nginx/sites-available/openbatch)
-# Resolve locally but preserve Host/SNI. After Certbot, follow the redirect and
-# validate the certificate too; a redirect alone is not a successful API probe.
-proxy_response=$(curl --fail --silent --show-error --max-time 10 --location --max-redirs 3 \
-  --proto-redir '=https' --noproxy '*' \
-  --resolve "$site_host:80:127.0.0.1" --resolve "$site_host:443:127.0.0.1" \
-  "http://$site_host/api/health")
-[[ "$proxy_response" == *'"service":"openbatch-backend"'* ]] || {
-  echo 'Proxy nao retornou a resposta esperada da API.' >&2; exit 1;
-}
-if [[ -n "$previous" ]]; then
-  ln -sfn "$previous" "$base/previous"
-fi
+systemctl --user restart openbatch-compose
+healthy "$target"
+if [[ -n "$previous" ]]; then ln -sfn "$previous" "$base/previous"; fi
 completed=true
-echo "Release ativa: $release_id"
+echo "Release ativa com Podman Compose rootless: $release_id"
