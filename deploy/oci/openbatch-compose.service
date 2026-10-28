@@ -1,0 +1,18 @@
+[Unit]
+Description=OpenBatch frontend and backend with rootless Podman Compose
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=%h/.local/share/openbatch/current/compose.yaml
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=PODMAN_COMPOSE_PROVIDER=/opt/openbatch-tools/bin/podman-compose
+ExecStart=/usr/local/lib/openbatch/compose-service.sh start
+ExecStop=/usr/local/lib/openbatch/compose-service.sh stop
+TimeoutStartSec=180
+TimeoutStopSec=90
+UMask=0077
+
+[Install]
+WantedBy=default.target

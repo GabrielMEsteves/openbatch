@@ -1,0 +1,180 @@
+name: OpenBatch CI/CD OCI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: openbatch-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  ci:
+    name: Lint, tests and build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+        working-directory: openbatch
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: openbatch/package-lock.json
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm run lint
+      - run: node --test podman-jobs.test.js
+      - run: npm run build
+      - name: Validate deployment scripts and variable handling
+        working-directory: .
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends shellcheck
+          for script in deploy/oci/*.sh; do bash -n "$script"; done
+          shellcheck deploy/oci/*.sh
+          python3 -m unittest discover -s deploy/oci -p 'test_*.py' -v
+
+  images:
+    name: Build, test and publish container images
+    needs: ci
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    # OCI Ampere is ARM64. OCI_ARCH is a repository variable, not an environment variable.
+    runs-on: ${{ vars.OCI_ARCH == 'amd64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE_ARCH: ${{ vars.OCI_ARCH || 'arm64' }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: Install Podman and the Compose provider on the disposable builder
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends podman python3-venv
+          python3 -m venv "$RUNNER_TEMP/compose-provider"
+          "$RUNNER_TEMP/compose-provider/bin/pip" install 'podman-compose==1.5.0'
+          echo "PODMAN_COMPOSE_PROVIDER=$RUNNER_TEMP/compose-provider/bin/podman-compose" >> "$GITHUB_ENV"
+      - name: Build frontend and backend for the VM architecture
+        run: |
+          set -euo pipefail
+          [[ "$IMAGE_ARCH" == arm64 || "$IMAGE_ARCH" == amd64 ]]
+          [[ "$IMAGE_ARCH:$(uname -m)" == arm64:aarch64 || "$IMAGE_ARCH:$(uname -m)" == amd64:x86_64 ]]
+          repository="${GITHUB_REPOSITORY,,}"
+          tag="$GITHUB_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          backend="ghcr.io/$repository-backend:$tag"
+          frontend="ghcr.io/$repository-frontend:$tag"
+          # Native modules and the React build execute inside the build stages.
+          sudo podman build --format docker --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            -f openbatch/Dockerfile.backend -t "$backend" openbatch
+          sudo podman build --format docker --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            -f openbatch/Dockerfile.frontend -t "$frontend" openbatch
+          printf 'BACKEND_TAG=%s\nFRONTEND_TAG=%s\n' "$backend" "$frontend" >> "$GITHUB_ENV"
+      - name: Smoke test the actual images with Podman Compose
+        run: |
+          set -euo pipefail
+          smoke="$RUNNER_TEMP/compose-smoke"
+          mkdir -p "$smoke/ssh"
+          cp deploy/oci/compose.yaml "$smoke/compose.yaml"
+          printf 'JWT_SECRET=%s\nSLURM_SSH_HOST=cluster.invalid\n' "$(openssl rand -hex 32)" > "$smoke/backend.env"
+          printf 'BACKEND_IMAGE=%s\nFRONTEND_IMAGE=%s\nSLURM_SSH_MOUNT=%s\nFRONTEND_PORT=18081\n' \
+            "$BACKEND_TAG" "$FRONTEND_TAG" "$smoke/ssh" > "$smoke/compose.env"
+          compose=(sudo env "PODMAN_COMPOSE_PROVIDER=$PODMAN_COMPOSE_PROVIDER" podman compose \
+            --env-file "$smoke/compose.env" -f "$smoke/compose.yaml" -p openbatch-ci)
+          trap '"${compose[@]}" down --volumes || true' EXIT
+          "${compose[@]}" up -d --no-build
+          bash deploy/oci/healthcheck.sh 18081
+      - name: Publish tested images to GHCR and record their immutable digests
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          auth_file="$RUNNER_TEMP/ghcr-build-auth.json"
+          trap 'rm -f -- "$auth_file"' EXIT
+          printf '%s' "$REGISTRY_TOKEN" | sudo podman login --authfile "$auth_file" \
+            --username "$GITHUB_ACTOR" --password-stdin ghcr.io
+          sudo podman push --authfile "$auth_file" --digestfile "$RUNNER_TEMP/backend.digest" "$BACKEND_TAG"
+          sudo podman push --authfile "$auth_file" --digestfile "$RUNNER_TEMP/frontend.digest" "$FRONTEND_TAG"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          temp = Path(os.environ['RUNNER_TEMP'])
+          repository = os.environ['GITHUB_REPOSITORY'].lower()
+          release = {
+              'revision': os.environ['GITHUB_SHA'],
+              'run_id': os.environ['GITHUB_RUN_ID'],
+              'run_attempt': os.environ['GITHUB_RUN_ATTEMPT'],
+              'architecture': os.environ['IMAGE_ARCH'],
+          }
+          for service in ('backend', 'frontend'):
+              digest = (temp / f'{service}.digest').read_text().strip()
+              release[f'{service}_image'] = f'ghcr.io/{repository}-{service}@{digest}'
+          (temp / 'release.json').write_text(json.dumps(release, indent=2) + '\n')
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: openbatch-images-${{ github.sha }}
+          path: ${{ runner.temp }}/release.json
+          if-no-files-found: error
+          retention-days: 7
+
+  deploy:
+    name: Deploy with rootless Podman Compose
+    needs: images
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: [self-hosted, Linux, openbatch-production]
+    environment:
+      name: production
+      url: ${{ vars.APP_URL }}
+    permissions:
+      contents: read
+      packages: read
+    concurrency:
+      group: openbatch-production
+      cancel-in-progress: false
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: openbatch-images-${{ github.sha }}
+          path: ${{ runner.temp }}/openbatch-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Pull images, write private runtime env files and activate Compose
+        env:
+          ARTIFACT_DIR: ${{ runner.temp }}/openbatch-${{ github.run_id }}-${{ github.run_attempt }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          SLURM_SSH_HOST: ${{ vars.SLURM_SSH_HOST }}
+          JWT_EXPIRES_IN: ${{ vars.JWT_EXPIRES_IN || '1h' }}
+          CORS_ORIGIN: ${{ vars.CORS_ORIGIN }}
+          UPLOAD_MAX_SIZE_MB: ${{ vars.UPLOAD_MAX_SIZE_MB || '50' }}
+          FRONTEND_BIND: ${{ vars.FRONTEND_BIND || '127.0.0.1' }}
+          FRONTEND_PORT: ${{ vars.FRONTEND_PORT || '8081' }}
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$(id -un)" = openbatch-runner
+          XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          export XDG_RUNTIME_DIR
+          export REGISTRY_AUTH_FILE="$RUNNER_TEMP/ghcr-deploy-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT.json"
+          trap 'rm -f -- "$REGISTRY_AUTH_FILE"; rm -rf -- "$ARTIFACT_DIR"' EXIT
+          printf '%s' "$REGISTRY_TOKEN" | podman login --username "$GITHUB_ACTOR" --password-stdin ghcr.io
+          /usr/local/bin/openbatch-deploy deploy "$ARTIFACT_DIR/release.json"
