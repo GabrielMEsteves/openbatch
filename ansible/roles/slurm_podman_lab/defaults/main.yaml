@@ -1,0 +1,10 @@
+---
+slurm_lab_user: pesquisador
+slurm_lab_uid: 2000
+slurm_lab_gid: 2000
+slurm_lab_service_uid: 64030
+slurm_lab_service_gid: 64030
+slurm_lab_shared: /srv/openbatch/users
+slurm_lab_cluster: openbatch
+slurm_lab_partition: debug
+slurm_lab_runner: openbatch-runner

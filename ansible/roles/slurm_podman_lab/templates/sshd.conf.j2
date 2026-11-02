@@ -1,0 +1,15 @@
+# Only this research user may authenticate by password from the portal host.
+# The specific Match must precede the fallback: sshd uses the first value.
+Match User {{ slurm_lab_user }} Address {{ ansible_host }},127.0.0.1
+    PasswordAuthentication yes
+    KbdInteractiveAuthentication no
+    AllowTcpForwarding no
+    X11Forwarding no
+    PermitTTY no
+Match User {{ slurm_lab_user }}
+    PasswordAuthentication no
+    KbdInteractiveAuthentication no
+    AllowTcpForwarding no
+    X11Forwarding no
+    PermitTTY no
+Match all

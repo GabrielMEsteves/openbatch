@@ -40,10 +40,12 @@ jobs:
         working-directory: .
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends shellcheck
+          sudo apt-get install -y --no-install-recommends shellcheck ansible
           for script in deploy/oci/*.sh; do bash -n "$script"; done
           shellcheck deploy/oci/*.sh
           python3 -m unittest discover -s deploy/oci -p 'test_*.py' -v
+          /usr/bin/python3 -m unittest discover -s validation -p 'test_*.py' -v
+          /usr/bin/ansible-playbook -i ansible/inventory.slurm-lab.example.ini --syntax-check ansible/04-openbatch-slurm-lab.yaml
 
   images:
     name: Build, test and publish container images
@@ -67,7 +69,7 @@ jobs:
       - name: Install Podman and the Compose provider on the disposable builder
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends podman python3-venv
+          sudo apt-get install -y --no-install-recommends podman netavark aardvark-dns python3-venv
           python3 -m venv "$RUNNER_TEMP/compose-provider"
           "$RUNNER_TEMP/compose-provider/bin/pip" install 'podman-compose==1.5.0'
           echo "PODMAN_COMPOSE_PROVIDER=$RUNNER_TEMP/compose-provider/bin/podman-compose" >> "$GITHUB_ENV"

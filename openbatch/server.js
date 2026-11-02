@@ -80,7 +80,7 @@ app.get('/api/health', (req, res) => {
 // --- 1. LOGIN ---
 app.post('/login', async (req, res) => {
     const { username, password } = req.body;
-    if (!username || !password) return res.status(400).json({ message: 'Campos obrigatórios.' });
+    if (typeof username !== 'string' || typeof password !== 'string' || !username || !password) return res.status(400).json({ message: 'Campos obrigatórios.' });
 
     if (ENABLE_DEV_LOGIN && username === 'admin' && password === process.env.ADMIN_PASSWORD) {
         const token = jwt.sign({ username: 'admin' }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });

@@ -11,10 +11,20 @@ source /etc/os-release
 case "$ID:$VERSION_ID" in
   ubuntu:24.04)
     apt-get update
-    apt-get install -y --no-install-recommends podman uidmap slirp4netns fuse-overlayfs \
+    # DNS is a recommended package, so --no-install-recommends otherwise omits
+    # the resolver required for frontend -> backend service-name resolution.
+    apt-get install -y --no-install-recommends podman netavark aardvark-dns uidmap slirp4netns fuse-overlayfs \
       python3-venv dbus-user-session curl ca-certificates git openssl openssh-client util-linux
     ;;
-  *) echo 'Bootstrap suportado: Ubuntu 24.04.' >&2; exit 1 ;;
+  *)
+    printf 'Sistema detectado: %s (%s %s).\n' "$PRETTY_NAME" "$ID" "$VERSION_ID" >&2
+    echo 'Instalacao interrompida: este bootstrap requer Ubuntu 24.04 LTS.' >&2
+    if [[ "$ID:$VERSION_ID" == ubuntu:20.04 ]]; then
+      echo 'Atualize o sistema em etapas: 20.04 -> 22.04 -> 24.04, ou use uma VM Ubuntu 24.04.' >&2
+    fi
+    echo 'Nenhum pacote foi instalado. A atualizacao do sistema deve ser feita pelo administrador.' >&2
+    exit 1
+    ;;
 esac
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 python3 -m venv /opt/openbatch-tools

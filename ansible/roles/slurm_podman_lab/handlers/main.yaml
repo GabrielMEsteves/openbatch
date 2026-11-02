@@ -1,0 +1,28 @@
+---
+- name: Restart lab NFS
+  ansible.builtin.systemd:
+    name: nfs-kernel-server
+    state: restarted
+
+- name: Restart lab Munge
+  ansible.builtin.systemd:
+    name: munge
+    state: restarted
+
+- name: Restart lab slurmdbd
+  ansible.builtin.systemd:
+    name: slurmdbd
+    state: restarted
+  when: inventory_hostname in groups['lab_controller']
+
+- name: Restart lab controller
+  ansible.builtin.systemd:
+    name: slurmctld
+    state: restarted
+  when: inventory_hostname in groups['lab_controller']
+
+- name: Restart lab worker
+  ansible.builtin.systemd:
+    name: slurmd
+    state: restarted
+  when: inventory_hostname in groups['lab_workers']
