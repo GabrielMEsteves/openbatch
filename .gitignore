@@ -1,3 +1,5 @@
 inventory.ini
 __pycache__/
 /deploy/oci/*.env
+/ansible/inventory.slurm-lab.ini
+/validation-results/

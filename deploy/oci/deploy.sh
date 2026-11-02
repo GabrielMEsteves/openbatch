@@ -18,6 +18,10 @@ flock -n 9 || { echo 'Outro deploy esta em andamento.' >&2; exit 1; }
 [[ $(podman info --format '{{.Host.Security.Rootless}}') == true ]] || {
   echo 'Podman precisa operar em modo rootless.' >&2; exit 1;
 }
+[[ $(podman info --format '{{.Host.NetworkBackend}}') == netavark ]] || {
+  echo 'Podman usa CNI. Migre a rede de openbatch-runner para Netavark antes do deploy; instale netavark e aardvark-dns.' >&2
+  exit 1
+}
 systemctl --user is-enabled --quiet openbatch-compose.service
 previous=''
 if [[ -L "$base/current" ]]; then

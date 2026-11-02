@@ -42,23 +42,33 @@ A API gera o script, chama `sbatch --parsable`, conserva o ID em volume persiste
 e consulta Slurm a cada cinco segundos enquanto a submissão estiver selecionada.
 Fechar a interface não cancela o job. A lista permite retomar o acompanhamento.
 
-O script usa `--cgroups=disabled`, configuração validada no laboratório WSL,
-para herdar o confinamento do Slurm. A rede da aplicação fica desabilitada.
+O script usa `--cgroups=disabled` para não criar uma hierarquia de cgroups
+concorrente com a do Slurm. CPU, memória, timeout e cancelamento precisam ser
+validados no executor real; `validation/run-cluster-tests.py` cobre esses casos.
+A rede do contêiner do job fica desabilitada.
 O download da imagem ocorre antes de iniciar o contêiner e requer acesso ao registry.
-Para reprodutibilidade, informe uma imagem por digest. A interface mostra o digest
-obtido e os últimos 64 KiB de cada log.
+Para reprodutibilidade entre submissões, informe uma imagem por digest. O script
+executa o ID exato retornado pelo pull, sem resolver novamente uma tag mutável.
+A interface mostra o digest obtido, o script e os últimos 64 KiB de cada log.
 
-O cancelamento usa `scancel`. `trap EXIT` faz limpeza normal; após encerramento
-confirmado pelo Slurm, as consultas e um monitor de 15 segundos reconciliam registros Podman no nó de entrada
-quando ele também é o nó de execução (laboratório WSL). Em outro nó, a interface
-mostra `remote-node-required`: configurar limpeza nesse nó é necessário antes de
-usar esta versão em um cluster distribuído. Sem resposta de `scontrol` e sem
-contabilidade `sacct`, o estado permanece `UNKNOWN`; não se presume conclusão.
+O cancelamento usa `scancel`. `trap EXIT` faz a limpeza normal. Para executor
+separado, o playbook `ansible/04-openbatch-slurm-lab.yaml` instala um Epilog do
+Slurm que remove somente os contêineres rootless rotulados com o ID daquele job,
+como seu proprietário, e grava um recibo no armazenamento compartilhado. O
+backend reconcilia esse recibo após a conclusão, inclusive depois de reiniciar.
+Sem recibo ou limpeza normal confirmada, mostra `pending-on-node`. Sem resposta
+de `scontrol` e sem contabilidade `sacct`, o estado permanece `UNKNOWN`.
+
+O laboratório usa duas VMs Ubuntu 24.04: portal conteinerizado e mestre Slurm
+na primeira; `slurmd` e Podman rootless na segunda. NFSv4 compartilha submissões
+e resultados; as camadas das imagens ficam no disco local do executor. O
+playbook instala a infraestrutura no host, mantém a aplicação conteinerizada e
+não executa os playbooks antigos de rede ou de instalação nativa do OpenBatch.
 
 O diretório de submissão é criado na home real do usuário no cluster. Montagens
 arbitrárias, MPI, GPU e multinó não são expostos pelo formulário. O fluxo antigo
 de terminal, upload e comandos continua local e não foi migrado para SSH nesta
-implementação; em Docker, use a nova aba para os jobs.
+implementação; no portal conteinerizado, use a aba de jobs com Podman.
 
 Testes do gerador e validação (Linux/WSL, Node instalado):
 

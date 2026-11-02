@@ -6,3 +6,5 @@
 deploy/oci/*.service text eol=lf
 deploy/oci/*.conf text eol=lf
 deploy/oci/*.example text eol=lf
+ansible/**/*.j2 text eol=lf
+*.py text eol=lf

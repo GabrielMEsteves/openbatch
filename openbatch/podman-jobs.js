@@ -20,6 +20,14 @@ export async function authenticateClusterUser(user, password) {
 const terminal = new Set(['COMPLETED', 'FAILED', 'CANCELLED', 'TIMEOUT', 'OUT_OF_MEMORY', 'NODE_FAIL', 'PREEMPTED', 'BOOT_FAIL', 'DEADLINE', 'REVOKED']);
 export const quote = value => `'${String(value).replaceAll("'", "'\\''")}'`;
 
+export function validCleanupReceipt(text, record, executionNode) {
+  try {
+    const receipt = JSON.parse(text);
+    return receipt.jobId === record.jobId && receipt.node === executionNode &&
+      receipt.status === 'done' && Date.parse(receipt.finishedAt) >= Date.parse(record.createdAt);
+  } catch { return false; }
+}
+
 export function validateJob(body) {
   const c = body?.config || {}, image = body?.container?.image;
   const executable = body?.container?.executable, args = body?.container?.args;
@@ -37,6 +45,7 @@ export function validateJob(body) {
 
 export function generateScript(job, containerName) {
   const { config: c, container: p } = validateJob(job);
+  if (!/^openbatch-[a-zA-Z0-9-]+$/.test(containerName)) throw new Error('Nome de contêiner inválido.');
   return `#!/bin/bash
 #SBATCH --job-name=${c.name}
 ${c.partition ? `#SBATCH --partition=${c.partition}\n` : ''}#SBATCH --nodes=1
@@ -49,22 +58,35 @@ ${c.partition ? `#SBATCH --partition=${c.partition}\n` : ''}#SBATCH --nodes=1
 set -euo pipefail
 # sbatch --chdir selects this submission's isolated directory.
 umask 077
+export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+test -d "$XDG_RUNTIME_DIR" || { echo 'Runtime rootless ausente: habilite linger para o usuario no executor.' >&2; exit 1; }
 mkdir -p resultados
 hostname > execution-node
+printf '%s\\n' "$SLURM_JOB_ID" > slurm-job-id
+cat /proc/self/cgroup > batch-cgroup
 finish() {
   rc=$?
   trap - EXIT
   printf '%s\\n' "$rc" > exit-code
-  podman rm -f ${quote(containerName)} >/dev/null 2>&1 || true
+  if podman rm -f --ignore ${quote(containerName)} >/dev/null 2>&1; then
+    printf 'done\\n' > cleanup-status
+  fi
   exit "$rc"
 }
 trap finish EXIT
-podman pull ${quote(p.image)}
-podman image inspect --format '{{.Digest}}' ${quote(p.image)} > image-digest
-srun podman --cgroup-manager=cgroupfs run --rm --name ${quote(containerName)} \\
-  --cgroups=disabled --userns=keep-id --network=none \\
+trap 'exit 143' TERM
+trap 'exit 130' INT
+image_id="$(podman pull --quiet ${quote(p.image)})"
+[[ "$image_id" =~ ^(sha256:)?[a-f0-9]{64}$ ]] || { echo 'ID de imagem invalido' >&2; exit 1; }
+printf '%s\\n' "$image_id" > image-id
+podman image inspect --format '{{.Digest}}' "$image_id" > image-digest
+srun --cpus-per-task="$SLURM_CPUS_PER_TASK" --cpu-bind=cores podman --cgroup-manager=cgroupfs run --rm --name ${quote(containerName)} \\
+  --pull=never --cgroups=disabled --userns=keep-id --network=none \\
+  --security-opt=no-new-privileges --cap-drop=ALL \\
+  --label "io.openbatch.slurm-job=$SLURM_JOB_ID" \\
+  --env SLURM_JOB_ID --env SLURM_CPUS_PER_TASK --env SLURMD_NODENAME \\
   --volume "$PWD/resultados:/resultados:rw" --workdir /resultados \\
-  --entrypoint ${quote(p.executable)} ${quote(p.image)} ${p.args.map(quote).join(' ')}
+  --entrypoint ${quote(p.executable)} "$image_id" ${p.args.map(quote).join(' ')}
 `;
 }
 
@@ -75,7 +97,7 @@ async function asUser(user, command, args = [], input) {
     if (!/^[a-zA-Z0-9._-]+$/.test(host)) throw new Error('SLURM_SSH_HOST inválido.');
     const key = path.join(process.env.SLURM_SSH_KEY_DIR || '/run/slurm-ssh', `${user}.key`);
     const remote = `exec ${[command, ...args].map(quote).join(' ')}`;
-    const sshArgs = ['-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ConnectTimeout=10', '-o', `UserKnownHostsFile=${process.env.SLURM_SSH_KNOWN_HOSTS || '/run/slurm-ssh/known_hosts'}`, '-i', key, `${user}@${host}`, remote];
+    const sshArgs = ['-T', '-o', 'BatchMode=yes', '-o', 'IdentitiesOnly=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ConnectTimeout=10', '-o', `UserKnownHostsFile=${process.env.SLURM_SSH_KNOWN_HOSTS || '/run/slurm-ssh/known_hosts'}`, '-i', key, `${user}@${host}`, remote];
     if (input === undefined) return exec('ssh', sshArgs, { timeout: 20000, maxBuffer: 1024 * 1024 });
     return new Promise((resolve, reject) => {
       const child = spawn('ssh', sshArgs);
@@ -149,13 +171,16 @@ export function installPodmanJobs(app, authenticate) {
     if (terminal.has(state) && cleanup !== 'done') {
       const executionNode = (await read(r, 'execution-node')).trim();
       if (!executionNode) cleanup = 'not-needed';
+      else if ((await read(r, 'cleanup-status')).trim() === 'done' || validCleanupReceipt(
+        await read(r, `../.cleanup/${r.jobId}.json`), r, executionNode,
+      )) cleanup = 'done';
       else if (executionNode === (process.env.SLURM_SSH_HOST ? (await asUser(r.user, 'hostname')).stdout.trim() : os.hostname())) {
         try { await asUser(r.user, 'podman', ['rm', '-f', '--ignore', r.containerName]); cleanup = 'done'; }
         catch { cleanup = 'failed'; }
-      } else cleanup = 'remote-node-required';
+      } else cleanup = 'pending-on-node';
     }
     if (terminal.has(state)) await save({ ...r, state, node, exitCode, terminal: true, cleanup });
-    return { ...r, state, node, exitCode, terminal: terminal.has(state), cleanup, stdout, stderr, digest: (await read(r, 'image-digest')).trim() };
+    return { ...r, state, node, exitCode, terminal: terminal.has(state), cleanup, stdout, stderr, digest: (await read(r, 'image-digest')).trim(), imageId: (await read(r, 'image-id')).trim(), script: await read(r, 'job.sbatch') };
   };
   const route = fn => async (req, res) => {
     try {
@@ -209,7 +234,7 @@ export function installPodmanJobs(app, authenticate) {
       try { files = await fs.readdir(store); } catch (e) { if (e.code === 'ENOENT') return; throw e; }
       for (const file of files.filter(f => f.endsWith('.json'))) {
         const record = JSON.parse(await fs.readFile(path.join(store, file), 'utf8'));
-        if (record.jobId && !(record.terminal && ['done', 'not-needed', 'remote-node-required'].includes(record.cleanup))) {
+        if (record.jobId && !(record.terminal && ['done', 'not-needed'].includes(record.cleanup))) {
           await snapshot(record).catch(e => console.error(`Reconciliação ${record.id}: ${e.message}`));
         }
       }

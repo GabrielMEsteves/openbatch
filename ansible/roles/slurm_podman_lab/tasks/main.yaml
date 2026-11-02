@@ -1,0 +1,583 @@
+---
+- name: Validate the dedicated Ubuntu lab topology
+  ansible.builtin.assert:
+    that:
+      - ansible_distribution == 'Ubuntu'
+      - ansible_distribution_version == '24.04'
+      - groups['lab_controller'] | length == 1
+      - groups['lab_workers'] | length == 1
+      - groups['lab_controller'][0] not in groups['lab_workers']
+      - hostvars[groups['lab_controller'][0]].ansible_host != hostvars[groups['lab_workers'][0]].ansible_host
+      - slurm_lab_user is match('^[a-z_][a-z0-9_-]*$')
+      - slurm_lab_user not in ['root', 'ubuntu', 'slurm', 'munge', slurm_lab_runner]
+      - slurm_lab_uid | int >= 1000
+      - slurm_lab_gid | int >= 1000
+      - ansible_host is match('^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
+      - ansible_memtotal_mb | int >= 3072
+    fail_msg: Use Ubuntu 24.04, private IPv4 addresses and at least 3 GiB RAM per VM.
+
+- name: Inspect an existing research account before making changes
+  ansible.builtin.getent:
+    database: passwd
+    key: '{{ slurm_lab_user }}'
+    fail_key: false
+
+- name: Refuse to repurpose an existing unrelated Linux user
+  ansible.builtin.assert:
+    that:
+      - >-
+        getent_passwd[slurm_lab_user] == none or
+        (getent_passwd[slurm_lab_user][1] | int == slurm_lab_uid | int and
+         getent_passwd[slurm_lab_user][4] == slurm_lab_shared ~ '/' ~ slurm_lab_user)
+    fail_msg: The research username already belongs to a different account. Choose another username/UID.
+
+- name: Check for an existing Slurm cluster
+  ansible.builtin.stat:
+    path: /etc/slurm/slurm.conf
+  register: slurm_lab_existing
+
+- name: Read existing configuration without changing it
+  ansible.builtin.slurp:
+    src: /etc/slurm/slurm.conf
+  register: slurm_lab_existing_config
+  when: slurm_lab_existing.stat.exists
+
+- name: Refuse to overwrite an unrelated cluster
+  ansible.builtin.assert:
+    that: "'Managed by OpenBatch lab' in (slurm_lab_existing_config.content | b64decode)"
+    fail_msg: This playbook is for a new research cluster. Existing Slurm configuration was preserved.
+  when: slurm_lab_existing.stat.exists
+
+- name: Check unified cgroups
+  ansible.builtin.command: stat -fc %T /sys/fs/cgroup
+  register: slurm_lab_cgroups
+  changed_when: false
+
+- name: Require cgroup v2
+  ansible.builtin.assert:
+    that: slurm_lab_cgroups.stdout == 'cgroup2fs'
+
+# Create Slurm's identity before package installation, identical on both nodes.
+- name: Create the Slurm service group
+  ansible.builtin.group:
+    name: slurm
+    gid: "{{ slurm_lab_service_gid }}"
+    system: true
+
+- name: Create the Slurm service user
+  ansible.builtin.user:
+    name: slurm
+    uid: "{{ slurm_lab_service_uid }}"
+    group: slurm
+    home: /var/lib/slurm
+    shell: /usr/sbin/nologin
+    system: true
+    create_home: false
+
+- name: Install shared cluster infrastructure
+  ansible.builtin.apt:
+    name: [munge, chrony, slurm-client, openssh-server, python3, netfilter-persistent, iptables-persistent]
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Create a research group with the same GID on both VMs
+  ansible.builtin.group:
+    name: "{{ slurm_lab_user }}"
+    gid: "{{ slurm_lab_gid }}"
+
+- name: Create the research account without sudo access
+  ansible.builtin.user:
+    name: "{{ slurm_lab_user }}"
+    uid: "{{ slurm_lab_uid }}"
+    group: "{{ slurm_lab_user }}"
+    home: "{{ slurm_lab_shared }}/{{ slurm_lab_user }}"
+    shell: /bin/bash
+    create_home: "{{ inventory_hostname in groups['lab_controller'] }}"
+    # Password is set interactively with passwd on the controller, never in Git.
+
+- name: Start time synchronization and Munge
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: started
+    enabled: true
+  loop: [chrony, munge]
+
+- name: Allow only the peer VM to reach the cluster's host ports
+  ansible.builtin.iptables:
+    chain: INPUT
+    action: insert
+    rule_num: '1'
+    source: "{{ hostvars[groups['lab_workers'][0]].ansible_host if inventory_hostname in groups['lab_controller'] else hostvars[groups['lab_controller'][0]].ansible_host }}"
+    protocol: tcp
+    destination_port: "{{ item }}"
+    ctstate: NEW
+    jump: ACCEPT
+    comment: OpenBatch private cluster
+  loop: "{{ ['2049', '6817', '6819', '60001:60020'] if inventory_hostname in groups['lab_controller'] else ['6818', '60001:60020'] }}"
+  register: slurm_lab_firewall
+
+- name: Persist host firewall rules without flushing existing rules
+  ansible.builtin.command: netfilter-persistent save
+  when: slurm_lab_firewall.changed
+  changed_when: true
+
+- name: Prepare the controller and shared filesystem
+  when: inventory_hostname in groups['lab_controller']
+  block:
+    - name: Install control-plane packages
+      ansible.builtin.apt:
+        name: [slurmctld, slurmdbd, mariadb-server, python3-pymysql, nfs-kernel-server]
+        state: present
+
+    - name: Create the private shared home
+      ansible.builtin.file:
+        path: "{{ slurm_lab_shared }}/{{ slurm_lab_user }}"
+        state: directory
+        owner: "{{ slurm_lab_user }}"
+        group: "{{ slurm_lab_user }}"
+        mode: '0700'
+
+    - name: Create NFS configuration directories
+      ansible.builtin.file:
+        path: '{{ item }}'
+        state: directory
+        owner: root
+        mode: '0755'
+      loop: [/etc/nfs.conf.d, /etc/exports.d]
+
+    - name: Use NFSv4 over TCP
+      ansible.builtin.copy:
+        dest: /etc/nfs.conf.d/openbatch.conf
+        content: "[nfsd]\nvers3=n\nvers4=y\nudp=n\ntcp=y\n"
+        mode: '0644'
+      notify: Restart lab NFS
+
+    - name: Export only the research homes to the worker's private IP
+      ansible.builtin.copy:
+        dest: /etc/exports.d/openbatch.exports
+        content: "{{ slurm_lab_shared }} {{ hostvars[groups['lab_workers'][0]].ansible_host }}(rw,sync,no_subtree_check,root_squash)\n"
+        mode: '0644'
+      notify: Restart lab NFS
+
+    - name: Enable NFS
+      ansible.builtin.systemd:
+        name: nfs-kernel-server
+        state: started
+        enabled: true
+
+    - name: Read the controller's Munge key for encrypted SSH distribution
+      ansible.builtin.slurp:
+        src: /etc/munge/munge.key
+      register: slurm_lab_munge
+      no_log: true
+
+    - name: Checksum the controller's Munge key
+      ansible.builtin.stat:
+        path: /etc/munge/munge.key
+      register: slurm_lab_munge_stat
+      no_log: true
+
+- name: Apply NFS exports before mounting the worker
+  ansible.builtin.meta: flush_handlers
+
+- name: Prepare the compute node
+  when: inventory_hostname in groups['lab_workers']
+  block:
+    - name: Install Slurm execution and rootless Podman
+      ansible.builtin.apt:
+        name: [slurmd, podman, netavark, aardvark-dns, uidmap, slirp4netns, fuse-overlayfs, dbus-user-session, nfs-common]
+        state: present
+
+    - name: Mount the same submission paths as the controller
+      ansible.posix.mount:
+        path: "{{ slurm_lab_shared }}"
+        src: "{{ hostvars[groups['lab_controller'][0]].ansible_host }}:{{ slurm_lab_shared }}"
+        fstype: nfs4
+        opts: rw,hard,_netdev,nosuid,nodev,vers=4.2
+        state: mounted
+
+    - name: Checksum the worker's Munge key
+      ansible.builtin.stat:
+        path: /etc/munge/munge.key
+      register: slurm_lab_worker_munge_stat
+      no_log: true
+
+    - name: Transfer the binary Munge key without text transcoding
+      ansible.builtin.shell: |
+        umask 077
+        /usr/bin/base64 --decode > /etc/munge/munge.key
+      args:
+        stdin: "{{ hostvars[groups['lab_controller'][0]].slurm_lab_munge.content }}"
+      when: slurm_lab_worker_munge_stat.stat.checksum != hostvars[groups['lab_controller'][0]].slurm_lab_munge_stat.stat.checksum
+      changed_when: true
+      no_log: true
+      notify: Restart lab Munge
+
+    - name: Protect the installed Munge key
+      ansible.builtin.file:
+        path: /etc/munge/munge.key
+        owner: munge
+        group: munge
+        mode: '0400'
+      no_log: true
+      notify: Restart lab Munge
+
+    - name: Check subordinate UID and GID allocations created by useradd
+      ansible.builtin.command:
+        argv: [grep, '-E', '^{{ slurm_lab_user }}:[0-9]+:[0-9]+$', '/etc/{{ item }}']
+      loop: [subuid, subgid]
+      changed_when: false
+
+    - name: Create the root-owned parent of local image stores
+      ansible.builtin.file:
+        path: /var/lib/openbatch-podman
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Keep Podman image layers on local disk, never NFS
+      ansible.builtin.file:
+        path: "/var/lib/openbatch-podman/{{ slurm_lab_uid }}"
+        state: directory
+        owner: "{{ slurm_lab_user }}"
+        group: "{{ slurm_lab_user }}"
+        mode: '0700'
+
+    - name: Enable a persistent rootless runtime for batch jobs
+      ansible.builtin.command:
+        argv: [loginctl, enable-linger, '{{ slurm_lab_user }}']
+        creates: '/var/lib/systemd/linger/{{ slurm_lab_user }}'
+
+    - name: Start the user's runtime without an interactive login
+      ansible.builtin.systemd:
+        name: 'user@{{ slurm_lab_uid }}.service'
+        state: started
+
+    - name: Discover actual Slurm hardware topology
+      ansible.builtin.command: /usr/sbin/slurmd -C
+      register: slurm_lab_hardware
+      changed_when: false
+
+- name: Configure runtime credentials and accounting on the controller
+  when: inventory_hostname in groups['lab_controller']
+  block:
+    - name: Create private configuration directories in the shared home
+      ansible.builtin.file:
+        path: '{{ slurm_lab_shared }}/{{ slurm_lab_user }}/{{ item }}'
+        state: directory
+        owner: '{{ slurm_lab_user }}'
+        group: '{{ slurm_lab_user }}'
+        mode: '0700'
+      loop: [.ssh, .config, .config/containers, .openbatch_jobs]
+
+    - name: Point rootless storage at the worker's local disk
+      ansible.builtin.copy:
+        dest: '{{ slurm_lab_shared }}/{{ slurm_lab_user }}/.config/containers/storage.conf'
+        content: |
+          [storage]
+          driver = "overlay"
+          runroot = "/run/user/{{ slurm_lab_uid }}/containers"
+          graphroot = "/var/lib/openbatch-podman/{{ slurm_lab_uid }}"
+        owner: '{{ slurm_lab_user }}'
+        group: '{{ slurm_lab_user }}'
+        mode: '0600'
+
+    - name: Confirm the existing portal runner account
+      ansible.builtin.getent:
+        database: passwd
+        key: '{{ slurm_lab_runner }}'
+
+    - name: Locate the existing portal SSH mount
+      ansible.builtin.set_fact:
+        slurm_lab_ssh_dir: "{{ getent_passwd[slurm_lab_runner][4] }}/.local/share/openbatch/ssh"
+
+    - name: Ensure the portal SSH mount exists
+      ansible.builtin.file:
+        path: '{{ slurm_lab_ssh_dir }}'
+        state: directory
+        owner: '{{ slurm_lab_runner }}'
+        group: '{{ slurm_lab_runner }}'
+        mode: '0700'
+
+    - name: Generate the user's portal key once, outside all container images
+      ansible.builtin.command:
+        argv: [runuser, '-u', '{{ slurm_lab_runner }}', '--', ssh-keygen, '-t', ed25519, '-N', '', '-f', '{{ slurm_lab_ssh_dir }}/{{ slurm_lab_user }}.key']
+        creates: '{{ slurm_lab_ssh_dir }}/{{ slurm_lab_user }}.key'
+      no_log: true
+
+    - name: Read the public client key
+      ansible.builtin.slurp:
+        src: '{{ slurm_lab_ssh_dir }}/{{ slurm_lab_user }}.key.pub'
+      register: slurm_lab_client_key
+
+    - name: Protect the per-user private key mounted by the portal
+      ansible.builtin.file:
+        path: '{{ slurm_lab_ssh_dir }}/{{ slurm_lab_user }}.key'
+        owner: '{{ slurm_lab_runner }}'
+        group: '{{ slurm_lab_runner }}'
+        mode: '0600'
+
+    - name: Authorize only the portal source, with no PTY or forwarding
+      ansible.builtin.lineinfile:
+        path: '{{ slurm_lab_shared }}/{{ slurm_lab_user }}/.ssh/authorized_keys'
+        line: 'restrict,from="{{ ansible_host }},127.0.0.1" {{ slurm_lab_client_key.content | b64decode | trim }}'
+        create: true
+        owner: '{{ slurm_lab_user }}'
+        group: '{{ slurm_lab_user }}'
+        mode: '0600'
+
+    - name: Read the local SSH host public key without network trust-on-first-use
+      ansible.builtin.slurp:
+        src: /etc/ssh/ssh_host_ed25519_key.pub
+      register: slurm_lab_host_key
+
+    - name: Trust the controller's verified host key in the portal
+      ansible.builtin.lineinfile:
+        path: '{{ slurm_lab_ssh_dir }}/known_hosts'
+        regexp: '^{{ ansible_host | regex_escape }} '
+        line: '{{ ansible_host }} {{ slurm_lab_host_key.content | b64decode | trim }}'
+        create: true
+        owner: '{{ slurm_lab_runner }}'
+        group: '{{ slurm_lab_runner }}'
+        mode: '0600'
+
+    - name: Allow password login for the research user from the portal only
+      ansible.builtin.template:
+        src: sshd.conf.j2
+        dest: /etc/ssh/sshd_config.d/00-openbatch-lab.conf
+        mode: '0644'
+        validate: /usr/sbin/sshd -t -f %s
+      register: slurm_lab_sshd
+
+    - name: Validate the full SSH configuration before reloading
+      ansible.builtin.command: /usr/sbin/sshd -t
+      changed_when: false
+
+    - name: Reload SSH while retaining the administrator's current session
+      ansible.builtin.systemd:
+        name: ssh
+        state: reloaded
+      when: slurm_lab_sshd.changed
+
+    - name: Start the local accounting database
+      ansible.builtin.systemd:
+        name: mariadb
+        state: started
+        enabled: true
+
+    - name: Generate and retain the database secret only on the VM
+      ansible.builtin.copy:
+        dest: /etc/slurm/openbatch-db.password
+        content: "{{ lookup('ansible.builtin.password', '/dev/null length=64 chars=ascii_letters,digits') }}\n"
+        force: false
+        owner: root
+        mode: '0600'
+      no_log: true
+
+    - name: Read the retained database secret
+      ansible.builtin.slurp:
+        src: /etc/slurm/openbatch-db.password
+      register: slurm_lab_db_secret
+      no_log: true
+
+    - name: Create the Slurm accounting database
+      community.mysql.mysql_db:
+        name: openbatch_slurm
+        state: present
+        login_unix_socket: /run/mysqld/mysqld.sock
+
+    - name: Grant the Slurm service access only to its own database
+      community.mysql.mysql_user:
+        name: openbatch_slurm
+        host: localhost
+        password: '{{ slurm_lab_db_secret.content | b64decode | trim }}'
+        priv: 'openbatch_slurm.*:ALL'
+        state: present
+        login_unix_socket: /run/mysqld/mysqld.sock
+      no_log: true
+
+- name: Create service directories
+  ansible.builtin.file:
+    path: '{{ item.path }}'
+    state: directory
+    owner: '{{ item.owner }}'
+    group: '{{ item.owner }}'
+    mode: '0755'
+  loop:
+    - {path: /var/lib/slurm/slurmctld, owner: slurm}
+    - {path: /var/lib/slurm/slurmd, owner: root}
+    - {path: /var/log/slurm, owner: slurm}
+    - {path: /usr/local/lib/openbatch, owner: root}
+
+- name: Initialize the rootless namespace outside any Slurm job cgroup
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/openbatch-podman-user.service
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=OpenBatch rootless Podman namespace for the research user
+      After=network-online.target remote-fs.target user@{{ slurm_lab_uid }}.service
+      Requires=user@{{ slurm_lab_uid }}.service
+      RequiresMountsFor={{ slurm_lab_shared }}
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      User={{ slurm_lab_user }}
+      Group={{ slurm_lab_user }}
+      Environment=HOME={{ slurm_lab_shared }}/{{ slurm_lab_user }}
+      Environment=XDG_RUNTIME_DIR=/run/user/{{ slurm_lab_uid }}
+      ExecStart=/usr/bin/podman unshare /usr/bin/true
+      [Install]
+      WantedBy=multi-user.target
+  when: inventory_hostname in groups['lab_workers']
+
+- name: Install the same Slurm configuration on both VMs
+  ansible.builtin.template:
+    src: slurm.conf.j2
+    dest: /etc/slurm/slurm.conf
+    owner: root
+    mode: '0644'
+  notify: [Restart lab controller, Restart lab worker]
+
+- name: Enable Slurm CPU, memory and device enforcement with cgroup v2
+  ansible.builtin.copy:
+    dest: /etc/slurm/cgroup.conf
+    mode: '0644'
+    content: |
+      CgroupPlugin=cgroup/v2
+      ConstrainCores=yes
+      ConstrainRAMSpace=yes
+      ConstrainSwapSpace=yes
+      AllowedSwapSpace=0
+      ConstrainDevices=yes
+  notify: Restart lab worker
+
+- name: Install cleanup on the execution node (runs as the job owner)
+  ansible.builtin.copy:
+    src: slurm-epilog.py
+    dest: /usr/local/lib/openbatch/slurm-epilog.py
+    owner: root
+    mode: '0755'
+
+- name: Configure accounting daemon
+  ansible.builtin.template:
+    src: slurmdbd.conf.j2
+    dest: /etc/slurm/slurmdbd.conf
+    owner: slurm
+    group: slurm
+    mode: '0600'
+  when: inventory_hostname in groups['lab_controller']
+  no_log: true
+  notify: Restart lab slurmdbd
+
+- name: Create systemd override directories
+  ansible.builtin.file:
+    path: '/etc/systemd/system/{{ item }}.service.d'
+    state: directory
+    mode: '0755'
+  loop: "{{ ['slurmctld', 'slurmdbd'] if inventory_hostname in groups['lab_controller'] else ['slurmd'] }}"
+
+- name: Start the accounting daemon after its dependencies
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/slurmdbd.service.d/openbatch.conf
+    mode: '0644'
+    content: |
+      [Unit]
+      After=munge.service mariadb.service network-online.target
+      Requires=munge.service mariadb.service
+      [Service]
+      User=slurm
+      Group=slurm
+      RuntimeDirectory=slurmdbd
+      PIDFile=/run/slurmdbd/slurmdbd.pid
+  when: inventory_hostname in groups['lab_controller']
+  notify: Restart lab slurmdbd
+
+- name: Start the controller after accounting
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/slurmctld.service.d/openbatch.conf
+    mode: '0644'
+    content: |
+      [Unit]
+      After=munge.service slurmdbd.service network-online.target
+      Requires=munge.service slurmdbd.service
+      [Service]
+      User=slurm
+      Group=slurm
+      RuntimeDirectory=slurmctld
+      PIDFile=/run/slurmctld/slurmctld.pid
+  when: inventory_hostname in groups['lab_controller']
+  notify: Restart lab controller
+
+- name: Delegate cgroups to slurmd and require the shared filesystem
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/slurmd.service.d/openbatch.conf
+    mode: '0644'
+    content: |
+      [Unit]
+      After=munge.service network-online.target remote-fs.target openbatch-podman-user.service
+      Requires=munge.service openbatch-podman-user.service
+      RequiresMountsFor={{ slurm_lab_shared }}
+      [Service]
+      Delegate=yes
+      TasksMax=infinity
+  when: inventory_hostname in groups['lab_workers']
+  notify: Restart lab worker
+
+- name: Reload systemd unit definitions
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Start rootless Podman before enabling Slurm execution
+  ansible.builtin.systemd:
+    name: openbatch-podman-user.service
+    state: started
+    enabled: true
+  when: inventory_hostname in groups['lab_workers']
+
+- name: Activate the complete configuration
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable Slurm services at boot
+  ansible.builtin.systemd:
+    name: '{{ item }}'
+    enabled: true
+    state: started
+  loop: "{{ ['slurmdbd', 'slurmctld'] if inventory_hostname in groups['lab_controller'] else ['slurmd'] }}"
+
+- name: Register cluster and research account in Slurm accounting
+  when: inventory_hostname in groups['lab_controller']
+  block:
+    - name: Read registered clusters
+      ansible.builtin.command: sacctmgr -nP show cluster format=Cluster
+      register: slurm_lab_clusters
+      changed_when: false
+      retries: 10
+      delay: 3
+      until: slurm_lab_clusters.rc == 0
+
+    - name: Register this cluster
+      ansible.builtin.command: 'sacctmgr -i add cluster {{ slurm_lab_cluster }}'
+      when: slurm_lab_cluster not in slurm_lab_clusters.stdout_lines
+      changed_when: true
+
+    - name: Read research account associations
+      ansible.builtin.command: 'sacctmgr -nP show assoc where cluster={{ slurm_lab_cluster }} account=tcc format=Account,User'
+      register: slurm_lab_associations
+      changed_when: false
+
+    - name: Create the research account
+      ansible.builtin.command: 'sacctmgr -i add account tcc cluster={{ slurm_lab_cluster }} Description=OpenBatch Organization=TCC'
+      when: "'tcc|' not in slurm_lab_associations.stdout_lines"
+      changed_when: true
+
+    - name: Associate the researcher with the cluster account
+      ansible.builtin.command: 'sacctmgr -i add user {{ slurm_lab_user }} account=tcc cluster={{ slurm_lab_cluster }} DefaultAccount=tcc'
+      when: "('tcc|' ~ slurm_lab_user) not in slurm_lab_associations.stdout_lines"
+      changed_when: true
+
+    - name: Show the next manual step
+      ansible.builtin.debug:
+        msg: 'Set the login password with sudo passwd {{ slurm_lab_user }}. Configure GitHub production variable SLURM_SSH_HOST={{ ansible_host }} and deploy the updated backend.'

@@ -1,0 +1,9 @@
+---
+# VM 1: existing containerized portal + Slurm controller. VM 2: compute node.
+# Run on VM 1 as ubuntu. This does not run the legacy networking/app playbooks.
+- name: Configure the two-VM OpenBatch research cluster
+  hosts: lab_cluster
+  become: true
+  gather_facts: true
+  roles:
+    - slurm_podman_lab
