@@ -20,6 +20,34 @@ export async function authenticateClusterUser(user, password) {
 const terminal = new Set(['COMPLETED', 'FAILED', 'CANCELLED', 'TIMEOUT', 'OUT_OF_MEMORY', 'NODE_FAIL', 'PREEMPTED', 'BOOT_FAIL', 'DEADLINE', 'REVOKED']);
 export const quote = value => `'${String(value).replaceAll("'", "'\\''")}'`;
 
+const allocatedNode = value => !value || value === '(null)' || value === 'None' ? '' : value;
+
+export async function getSlurmStatus(record, run) {
+  let state = record.terminal ? record.state : 'UNKNOWN';
+  let node = allocatedNode(record.node), exitCode = record.exitCode || '';
+  // Re-query old terminal records whose node was incorrectly read from ReqNodeList.
+  if (record.terminal && node) return { state, node, exitCode };
+  try {
+    const { stdout } = await run('scontrol', ['show', 'job', record.jobId, '-o']);
+    // Match whole field names: NodeList must not match ReqNodeList or ExcNodeList.
+    state = stdout.match(/(?:^|\s)JobState=(\S+)/)?.[1] || state;
+    node = allocatedNode(stdout.match(/(?:^|\s)NodeList=(\S+)/)?.[1]);
+    exitCode = stdout.match(/(?:^|\s)ExitCode=(\S+)/)?.[1] || exitCode;
+  } catch {
+    try {
+      const { stdout } = await run('sacct', ['-j', record.jobId, '-n', '-P', '--format=JobIDRaw,State,ExitCode,NodeList']);
+      const row = stdout.split('\n').find(line => line.split('|')[0].trim() === record.jobId);
+      if (row) {
+        const fields = row.trim().split('|');
+        state = fields[1].split(/[ +]/)[0];
+        exitCode = fields[2];
+        node = allocatedNode(fields[3]);
+      }
+    } catch { /* Accounting may not be installed; never invent a terminal state. */ }
+  }
+  return { state, node, exitCode };
+}
+
 export function validCleanupReceipt(text, record, executionNode) {
   try {
     const receipt = JSON.parse(text);
@@ -150,22 +178,7 @@ export function installPodmanJobs(app, authenticate) {
   };
   const snapshot = async r => {
     if (!r.jobId) return { ...r, state: 'SUBMISSION_UNCERTAIN', message: 'Verifique a fila antes de repetir a submissão.' };
-    let state = r.terminal ? r.state : 'UNKNOWN', node = r.node || '', exitCode = r.exitCode || '';
-    if (!r.terminal) {
-    try {
-      const output = (await asUser(r.user, 'scontrol', ['show', 'job', r.jobId, '-o'])).stdout;
-      state = output.match(/JobState=(\S+)/)?.[1] || state;
-      node = output.match(/NodeList=(\S+)/)?.[1] || '';
-      exitCode = output.match(/ExitCode=(\S+)/)?.[1] || '';
-    } catch {
-      try {
-        const rows = (await asUser(r.user, 'sacct', ['-j', r.jobId, '-n', '-P', '--format=JobIDRaw,State,ExitCode,NodeList'])).stdout.split('\n');
-        const row = rows.find(line => line.split('|')[0] === r.jobId);
-        if (row) [, state, exitCode, node] = row.split('|');
-        state = state.split(/[ +]/)[0];
-      } catch { /* Accounting may not be installed; never invent a terminal state. */ }
-    }
-    }
+    const { state, node, exitCode } = await getSlurmStatus(r, (command, args) => asUser(r.user, command, args));
     const stdout = await read(r, 'stdout.log'), stderr = await read(r, 'stderr.log');
     let cleanup = r.cleanup || 'pending';
     if (terminal.has(state) && cleanup !== 'done') {

@@ -1,9 +1,60 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { validateJob, generateScript, quote, validCleanupReceipt } from './podman-jobs.js';
+import { validateJob, generateScript, quote, validCleanupReceipt, getSlurmStatus } from './podman-jobs.js';
 
 const job = { config: { name: 'demo', partition: 'debug', cpus: 1, memoryMiB: 256, time: '00:02:00' }, container: { image: 'docker.io/library/python:3.12-slim', executable: 'python', args: ['-c', "print('ok')"] } };
+
+test('status reads allocated NodeList instead of requested or excluded nodes', async () => {
+  const result = await getSlurmStatus({ jobId: '4' }, async () => ({
+    stdout: 'JobId=4 JobState=COMPLETED ExitCode=0:0 ReqNodeList=(null) ExcNodeList=worker2 NodeList=worker1 BatchHost=node\n',
+  }));
+  assert.deepEqual(result, { state: 'COMPLETED', node: 'worker1', exitCode: '0:0' });
+});
+
+test('pending jobs do not report requested nodes as allocated nodes', async () => {
+  for (const allocation of ['', ' NodeList=(null)']) {
+    const result = await getSlurmStatus({ jobId: '4' }, async () => ({
+      stdout: `JobState=PENDING ReqNodeList=worker1 ExcNodeList=(null)${allocation} ExitCode=0:0`,
+    }));
+    assert.equal(result.state, 'PENDING');
+    assert.equal(result.node, '');
+  }
+});
+
+test('old terminal records with null nodes are refreshed from the controller', async () => {
+  const result = await getSlurmStatus({ jobId: '4', terminal: true, state: 'COMPLETED', node: '(null)', exitCode: '0:0' }, async command => {
+    assert.equal(command, 'scontrol');
+    return { stdout: 'JobState=COMPLETED ReqNodeList=(null) NodeList=worker1 ExitCode=0:0' };
+  });
+  assert.equal(result.node, 'worker1');
+});
+
+test('old terminal records recover from accounting after controller expiry', async () => {
+  const calls = [];
+  const result = await getSlurmStatus({ jobId: '4', terminal: true, state: 'COMPLETED', node: '(null)' }, async (command, args) => {
+    calls.push(command);
+    assert.ok(args.includes('4'));
+    if (command === 'scontrol') throw new Error('Invalid job id');
+    return { stdout: '4.batch|COMPLETED|0:0|wrong-node|\n4|COMPLETED|0:0|worker1|\n' };
+  });
+  assert.deepEqual(calls, ['scontrol', 'sacct']);
+  assert.deepEqual(result, { state: 'COMPLETED', node: 'worker1', exitCode: '0:0' });
+});
+
+test('missing scheduler data does not invent a node or a terminal state', async () => {
+  const run = async () => { throw new Error('Unavailable'); };
+  assert.deepEqual(await getSlurmStatus({ jobId: '4' }, run), { state: 'UNKNOWN', node: '', exitCode: '' });
+  assert.deepEqual(await getSlurmStatus({ jobId: '4', terminal: true, state: 'COMPLETED', node: '(null)', exitCode: '0:0' }, run),
+    { state: 'COMPLETED', node: '', exitCode: '0:0' });
+});
+
+test('valid terminal status remains cached', async () => {
+  const result = await getSlurmStatus({ jobId: '4', terminal: true, state: 'COMPLETED', node: 'worker1', exitCode: '0:0' }, async () => {
+    assert.fail('A valid terminal record should not query Slurm again');
+  });
+  assert.deepEqual(result, { state: 'COMPLETED', node: 'worker1', exitCode: '0:0' });
+});
 test('rejects injected directives and invalid numeric resources', () => {
   for (const config of [{ name: 'x\n#SBATCH --uid=root' }, { partition: 'debug\nfoo' }, { cpus: 0 }, { memoryMiB: '256' }, { time: '00:99:00' }]) assert.throws(() => validateJob({ ...job, config: { ...job.config, ...config } }));
 });
